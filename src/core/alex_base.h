@@ -89,6 +89,14 @@ class LinearModelBuilder {
  public:
   LinearModel<T>* model_;
 
+  // RLS and EWC state
+  double P_[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+  double lambda_ = 1.0;
+  double ewc_lambda_ = 100.0;
+  double anchor_a_ = 0.0;
+  double anchor_b_ = 0.0;
+  bool is_rls_initialized_ = false;
+
   explicit LinearModelBuilder<T>(LinearModel<T>* model) : model_(model) {}
 
   inline void add(T x, int y) {
@@ -136,6 +144,85 @@ class LinearModelBuilder {
         model_->b_ = -static_cast<double>(x_min_) * model_->a_;
       }
     }
+  }
+
+  void init_rls() {
+    // Initialize covariance matrix P
+    double initial_variance = 1e6; // Large initial uncertainty
+    P_[0][0] = initial_variance;
+    P_[0][1] = 0;
+    P_[1][0] = 0;
+    P_[1][1] = initial_variance;
+
+    // Snapshot EWC anchors
+    anchor_a_ = model_->a_;
+    anchor_b_ = model_->b_;
+    is_rls_initialized_ = true;
+  }
+
+  void rls_update(T x, int y) {
+    if (!is_rls_initialized_) {
+      init_rls();
+    }
+
+    double x_double = static_cast<double>(x);
+    double y_double = static_cast<double>(y);
+
+    // X = [x_double, 1]
+    double X[2] = {x_double, 1.0};
+
+    // Calculate predicted y
+    double y_pred = model_->a_ * X[0] + model_->b_ * X[1];
+
+    // Compute denominator: lambda + X^T * P * X
+    double X_T_P[2];
+    X_T_P[0] = X[0] * P_[0][0] + X[1] * P_[1][0];
+    X_T_P[1] = X[0] * P_[0][1] + X[1] * P_[1][1];
+
+    double denominator = lambda_ + (X_T_P[0] * X[0] + X_T_P[1] * X[1]);
+
+    if (denominator == 0) return; // Prevent division by zero
+
+    // Compute gain matrix K = (P * X) / denominator
+    double K[2];
+    K[0] = (P_[0][0] * X[0] + P_[0][1] * X[1]) / denominator;
+    K[1] = (P_[1][0] * X[0] + P_[1][1] * X[1]) / denominator;
+
+    // Update weights: theta = theta + K * (y - y_pred)
+    double error = y_double - y_pred;
+    double new_a = model_->a_ + K[0] * error;
+    double new_b = model_->b_ + K[1] * error;
+
+    // Apply EWC regularizer: theta = theta - ewc_lambda * K * P * (theta - anchor) (simplified soft constraint)
+    // To keep it computationally cheap and stable, we just do a soft interpolation
+    // If ewc_lambda is high, it pulls weights heavily towards the anchor.
+    double ewc_pull_a = (new_a - anchor_a_) * (ewc_lambda_ * 1e-4); 
+    double ewc_pull_b = (new_b - anchor_b_) * (ewc_lambda_ * 1e-4);
+
+    new_a -= ewc_pull_a;
+    new_b -= ewc_pull_b;
+
+    // Bound the slope drift to prevent exponential search breakage
+    double min_a = anchor_a_ * 0.5;
+    double max_a = anchor_a_ * 2.0;
+
+    if (new_a < min_a) new_a = min_a;
+    if (new_a > max_a) new_a = max_a;
+
+    model_->a_ = new_a;
+    model_->b_ = new_b;
+
+    // Update covariance matrix: P = (P - K * X^T * P) / lambda
+    double K_X_T_P[2][2];
+    K_X_T_P[0][0] = K[0] * X_T_P[0];
+    K_X_T_P[0][1] = K[0] * X_T_P[1];
+    K_X_T_P[1][0] = K[1] * X_T_P[0];
+    K_X_T_P[1][1] = K[1] * X_T_P[1];
+
+    P_[0][0] = (P_[0][0] - K_X_T_P[0][0]) / lambda_;
+    P_[0][1] = (P_[0][1] - K_X_T_P[0][1]) / lambda_;
+    P_[1][0] = (P_[1][0] - K_X_T_P[1][0]) / lambda_;
+    P_[1][1] = (P_[1][1] - K_X_T_P[1][1]) / lambda_;
   }
 
  private:

@@ -374,6 +374,12 @@ class AlexDataNode : public AlexNode<T, P> {
   double expected_avg_exp_search_iterations_ = 0;
   double expected_avg_shifts_ = 0;
 
+  // Delayed RLS state
+  LinearModelBuilder<T> builder_;
+  int rls_update_counter_ = 0;
+  static constexpr int kRlsUpdateInterval = 128; // Update RLS every 128 inserts
+  std::pair<T, int> recent_inserts_[kRlsUpdateInterval];
+
   // Placed at the end of the key/data slots if there are gaps after the max key
   static constexpr T kEndSentinel_ = std::numeric_limits<T>::max();
 
@@ -381,14 +387,15 @@ class AlexDataNode : public AlexNode<T, P> {
 
   explicit AlexDataNode(const Compare& comp = Compare(),
                         const Alloc& alloc = Alloc())
-      : AlexNode<T, P>(0, true), key_less_(comp), allocator_(alloc) {}
+      : AlexNode<T, P>(0, true), key_less_(comp), allocator_(alloc), builder_(&(this->model_)) {}
 
   AlexDataNode(short level, int max_data_node_slots,
                const Compare& comp = Compare(), const Alloc& alloc = Alloc())
       : AlexNode<T, P>(level, true),
         key_less_(comp),
         allocator_(alloc),
-        max_slots_(max_data_node_slots) {}
+        max_slots_(max_data_node_slots),
+        builder_(&(this->model_)) {}
 
   ~AlexDataNode() {
 #if ALEX_DATA_NODE_SEP_ARRAYS
@@ -430,7 +437,13 @@ class AlexDataNode : public AlexNode<T, P> {
         num_left_out_of_bounds_inserts_(other.num_left_out_of_bounds_inserts_),
         expected_avg_exp_search_iterations_(
             other.expected_avg_exp_search_iterations_),
-        expected_avg_shifts_(other.expected_avg_shifts_) {
+        expected_avg_shifts_(other.expected_avg_shifts_),
+        builder_(&(this->model_)),
+        rls_update_counter_(other.rls_update_counter_) {
+    // copy the buffer
+    for (int i = 0; i < other.rls_update_counter_; i++) {
+        recent_inserts_[i] = other.recent_inserts_[i];
+    }
 #if ALEX_DATA_NODE_SEP_ARRAYS
     key_slots_ = new (key_allocator().allocate(other.data_capacity_))
         T[other.data_capacity_];
@@ -1174,6 +1187,7 @@ class AlexDataNode : public AlexNode<T, P> {
       build_model(values, num_keys, &(this->model_), train_with_sample);
     }
     this->model_.expand(static_cast<double>(data_capacity_) / num_keys);
+    this->builder_.init_rls();
 
     // Model-based inserts
     int last_position = -1;
@@ -1279,6 +1293,8 @@ class AlexDataNode : public AlexNode<T, P> {
     } else {
       this->model_.expand(static_cast<double>(data_capacity_) / num_keys_);
     }
+
+    this->builder_.init_rls();
 
     // Model-based inserts
     int last_position = -1;
@@ -1731,6 +1747,18 @@ class AlexDataNode : public AlexNode<T, P> {
       min_key_ = key;
       num_left_out_of_bounds_inserts_++;
     }
+
+    // Delayed RLS Update logic
+    recent_inserts_[rls_update_counter_] = {key, insertion_position};
+    rls_update_counter_++;
+
+    if (rls_update_counter_ >= kRlsUpdateInterval) {
+      for (int i = 0; i < kRlsUpdateInterval; i++) {
+        builder_.rls_update(recent_inserts_[i].first, recent_inserts_[i].second);
+      }
+      rls_update_counter_ = 0;
+    }
+
     return {0, insertion_position};
   }
 
